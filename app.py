@@ -130,6 +130,7 @@ async def explain(request):
         print("i am in line number 90" )
         feature_values = data.get("feature_values")
         prediction = data.get("prediction", None)
+        is_high_risk = bool(prediction)
         print("i am in line number 93")
         if feature_values is None or len(feature_values) != len(top_features):
             return sjson({"error": f"feature_values must be a list of {len(top_features)} numbers"}, status=400)
@@ -169,9 +170,10 @@ async def explain(request):
         ])
 
         print("line num 135")
+        risk_label = "high" if is_high_risk else "low"
         prompt = f"""You are a medical AI assistant. Based on the breast cancer risk analysis below, provide explanations for both a doctor and a patient.
 
-                            High breast cancer risk detected.
+                    The model prediction is {risk_label} breast cancer risk.
                             SHAP feature analysis: {current_exp}
 
                             Please respond with ONLY valid JSON in this exact format:
@@ -196,21 +198,33 @@ async def explain(request):
             except Exception:
                 output=None
         if not output:
-            doctor_text = (
+            if is_high_risk:
+                doctor_text = (
+                    """The model predicts high breast cancer risk, with one or more features contributing positively toward the prediction.
+
+The SHAP contributions show which measured factors increased the model's estimated risk. This result should be interpreted alongside clinical examination, imaging, pathology, and the patient's complete medical history.
+
+Clinical follow-up and confirmatory evaluation by a qualified healthcare professional are recommended. This model output is not a diagnosis."""
+                )
+                patient_text = (
+                    """The model identified a higher estimated risk based on the information provided. This result is not a diagnosis, and it does not confirm that you have cancer.
+
+Please discuss the result with a qualified healthcare professional, who can consider your full medical history and recommend any appropriate follow-up tests. Keep regular screenings and appointments."""
+                )
+            else:
+                doctor_text = (
                     """The model predicts low breast cancer risk, as no single feature shows a strong positive contribution toward malignancy.
 
 ER status and PR status have mild positive SHAP values, indicating limited influence on risk, while tumor size and molecular subtype contributions remain minimal. The absence of dominant high-risk features supports the low-risk classification.
 
 Clinically, this suggests no immediate concern, and the patient may continue with standard surveillance protocols and routine follow-up, without the need for aggressive diagnostic intervention at this stage."""
-                )
-
-            patient_text = (
-                """Good news! Your test results indicate a low risk of breast cancer at this time.
+                    )
+                patient_text = (
+                    """The model estimates a lower risk based on the information provided. This result is not a diagnosis, and regular health check-ups and recommended screenings remain important.
 The contributing factors, such as hormone receptor status and tumor characteristics, suggest that there are no strong indicators of aggressive disease.
 
-However, maintaining regular health check-ups and routine screenings is still very important. A healthy lifestyle, balanced diet, physical activity, and awareness of any changes in your body will help ensure continued well-being."""
-
-            )
+Please discuss the result with a qualified healthcare professional if you have concerns or notice changes in your health."""
+                )
                     
 
         else:
