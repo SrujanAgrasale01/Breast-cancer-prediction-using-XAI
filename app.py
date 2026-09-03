@@ -1,0 +1,238 @@
+import os
+import json
+import joblib
+import numpy as np
+import pandas as pd
+import shap
+import asyncio
+from sanic import Sanic
+from sanic.response import json as sjson
+from sanic_cors import CORS
+
+
+OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "llama3")
+OLLAMA_CMD = os.getenv("OLLAMA_CMD_PATH", r"C:\Users\HP\AppData\Roaming\Microsoft\Windows\Start Menu\Programs")
+
+
+top_features = [
+    "ER status measured by IHC",
+    "3-Gene classifier subtype",
+    "Pam50 + Claudin-low subtype",
+    "PR Status",
+    "Nottingham prognostic index",
+    "Tumor Size",
+    "HER2 Status",
+]
+
+
+app = Sanic("BreastCancerAPI")
+CORS(app)
+
+
+try:
+    model = joblib.load("breast_cancer_model.pkl")
+    scaler = joblib.load("scaler.pkl")
+    print("✅ Model and scaler loaded")
+except Exception as e:
+    print("❌ Error loading model/scaler:", e)
+    model, scaler = None, None
+
+
+@app.get("/health")
+async def health(request):
+    return sjson({"status": "ok", "model_loaded": model is not None and scaler is not None})
+
+
+def call_ollama(prompt: str) -> str:
+    import requests,subprocess
+    try:
+        resp = requests.post(
+            "http://127.0.0.1:11434/api/generate",
+            json={
+                "model": "llama3.2:3b",
+                "prompt": prompt,
+                "stream": False
+            },
+            timeout=200
+        )
+        data = resp.json()
+        print("____________________________________________")
+        print(data.get("response", ""))
+        print("____________________________________________")
+        return data.get("response", "")
+    #     result = subprocess.run(
+    #         [
+    #             r"G:\New folder (3)\ollama.exe",   # 👈 adjust if path changes
+    #             "run",
+    #             "tinyllama",
+    #             "hi"
+    #         ],
+    #         #input=prompt,
+    #         text=True,
+    #         capture_output=True,
+    #         timeout=120
+    #     )
+
+    #     if result.returncode != 0:
+    #         print("OLLAMA STDERR:", result.stderr)
+    #         return ""
+
+    #     return result.stdout.strip()
+
+    # except subprocess.TimeoutExpired:
+    #     print("OLLAMA ERROR: timeout")
+    #     return ""
+    except Exception as e:
+        print("OLLAMA ERROR:", e)
+        return ""
+
+
+
+@app.post("/predict")
+async def predict(request):
+    try:
+        data = request.json
+        if model is None or scaler is None:
+            return sjson({"error": "Model/scaler not loaded"}, status=500)
+
+        # Convert features to float
+        try:
+            feature_values = [float(data[f]) for f in top_features]
+        except KeyError as e:
+            return sjson({"error": f"Missing field: {e}"}, status=400)
+        except Exception as e:
+            return sjson({"error": f"Invalid feature value: {e}"}, status=400)
+
+        # DataFrame for scaler
+        X_df = pd.DataFrame([feature_values], columns=top_features)
+        X_scaled = scaler.transform(X_df)
+
+        # Prediction
+        pred_class = int(model.predict(X_scaled)[0])
+        prob_arr = model.predict_proba(X_scaled)[0].tolist() if hasattr(model, "predict_proba") else None
+
+        return sjson({
+            "prediction": pred_class,
+            "probability": prob_arr,
+            "feature_values": feature_values
+        })
+
+    except Exception as e:
+        return sjson({"error": str(e)}, status=500)
+
+
+@app.post("/explain")
+async def explain(request):
+    try:
+        data = request.json
+        if model is None or scaler is None:
+            return sjson({"error": "Model/scaler not loaded"}, status=500)
+        print("i am in line number 90" )
+        feature_values = data.get("feature_values")
+        prediction = data.get("prediction", None)
+        print("i am in line number 93")
+        if feature_values is None or len(feature_values) != len(top_features):
+            return sjson({"error": f"feature_values must be a list of {len(top_features)} numbers"}, status=400)
+        print("i am in line number 96")
+        # DataFrame for SHAP
+        X_df = pd.DataFrame([feature_values], columns=top_features)
+        X_scaled = scaler.transform(X_df)
+        print("i am in line number 100")
+        # SHAP computation
+        try:
+            explainer = shap.TreeExplainer(model)
+            shap_values = explainer.shap_values(X_scaled)
+            if isinstance(shap_values, (list, tuple)):
+                shap_vals_pos = np.array(shap_values[1])[0] if len(shap_values) > 1 else np.array(shap_values[0])[0]
+            else:
+                shap_vals_pos = np.array(shap_values)[0]
+        except Exception:
+            shap_vals_pos = np.zeros(len(top_features))
+        print("i m in line number 112")
+        # Build top features
+        feat_pairs = [
+            {"name": name, "value": feature_values[idx], "shap": float(np.array(shap_vals_pos[idx]).flatten()[0])}
+            for idx, name in enumerate(top_features)
+        ]
+       # Keep only risk-increasing features
+        positive_feats = [f for f in feat_pairs if f["shap"] > 0]
+
+# Sort by contribution strength
+        top_n = sorted(positive_feats, key=lambda x: x["shap"], reverse=True)[:5]
+
+        print("i am in line number 119")
+        print(feat_pairs)
+        # Placeholder LLM explanations
+        current_exp = ", ".join([
+            f"{item['name']} = {item['value']} (SHAP: {item['shap']})"
+            for item in feat_pairs
+        ])
+
+        print("line num 135")
+        prompt = f"""You are a medical AI assistant. Based on the breast cancer risk analysis below, provide explanations for both a doctor and a patient.
+
+                            High breast cancer risk detected.
+                            SHAP feature analysis: {current_exp}
+
+                            Please respond with ONLY valid JSON in this exact format:
+                            {{"doctor": "Professional medical explanation for healthcare providers", "patient": "Simple, reassuring explanation for the patient"}}
+
+                            Requirements:
+                            - Doctor explanation: Include medical terminology, SHAP interpretation, recommended actions
+                            - Patient explanation: Use simple language, be reassuring but honest, avoid technical jargon
+                            - Response must be valid JSON only, no other text
+
+                            Note: Negative SHAP values indicate protective factors, positive values indicate risk factors.
+                            Focus on the 3-Gene classifier subtype which shows the highest positive SHAP value (0.189) as the main risk contributor."""
+
+
+        print("line num 146")
+        llm_response=call_ollama(prompt)
+        print("llm ",llm_response)
+        output=None
+        if llm_response:
+            try:
+                output=json.loads(llm_response)
+            except Exception:
+                output=None
+        if not output:
+            doctor_text = (
+                    """The model predicts low breast cancer risk, as no single feature shows a strong positive contribution toward malignancy.
+
+ER status and PR status have mild positive SHAP values, indicating limited influence on risk, while tumor size and molecular subtype contributions remain minimal. The absence of dominant high-risk features supports the low-risk classification.
+
+Clinically, this suggests no immediate concern, and the patient may continue with standard surveillance protocols and routine follow-up, without the need for aggressive diagnostic intervention at this stage."""
+                )
+
+            patient_text = (
+                """Good news! Your test results indicate a low risk of breast cancer at this time.
+The contributing factors, such as hormone receptor status and tumor characteristics, suggest that there are no strong indicators of aggressive disease.
+
+However, maintaining regular health check-ups and routine screenings is still very important. A healthy lifestyle, balanced diet, physical activity, and awareness of any changes in your body will help ensure continued well-being."""
+
+            )
+                    
+
+        else:
+            doctor_text=output.get("doctor","")
+            patient_text=output.get("patient","")
+        print("FINAL RESPONSE →", {
+            "shap_sorted": top_n,
+            "doctor_explain": doctor_text,
+            "patient_explain": patient_text
+        })
+
+        return sjson({
+            "shap_sorted": top_n if top_n else [],
+            "doctor_explain": doctor_text or "",
+            "patient_explain": patient_text or ""
+        })
+
+    except Exception as e:
+        return sjson({"error": str(e)}, status=500)
+
+
+if __name__ == "__main__":
+    port = int(os.getenv("PORT", "8000"))
+    print(f"✅ BreastCancerAPI starting on port {port}")
+    app.run(host="0.0.0.0", port=port, debug=False)

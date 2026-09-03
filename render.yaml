@@ -1,0 +1,15 @@
+services:
+  - type: web
+    name: breast-cancer-api
+    runtime: python
+    buildCommand: pip install -r requirements.txt
+    startCommand: python app.py
+    healthCheckPath: /health
+
+  - type: web
+    name: breast-cancer-frontend
+    buildCommand: cd frontend && npm ci && npm run build
+    staticPublishPath: frontend/build
+    envVars:
+      - key: REACT_APP_API_URL
+        value: https://breast-cancer-api.onrender.com
